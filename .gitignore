@@ -1,0 +1,75 @@
+# ── Dependencies (86 MB, reinstall with npm ci) ──
+node_modules/
+**/node_modules/
+
+# ── Vite / frontend build output (regenerates with npm run build) ──
+dist/
+**/dist/
+dist-ssr/
+**/dist-ssr/
+*.local
+
+# ── Rust / Tauri (3.2 GB target/ — NEVER commit) ──
+**/src-tauri/target/
+**/src-tauri/gen/schemas
+target/
+*.rs.bk
+*.pdb
+
+# ── Tauri bundles / installers ──
+*.dmg
+*.msi
+*.msix
+*.AppImage
+*.deb
+*.rpm
+*.exe
+*.nsis.zip
+*.app.tar.gz
+*.sig
+src-tauri/Wix/
+src-tauri/nsis/
+
+# ── Env / secrets (none in repo now — keep it that way) ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# ── Logs ──
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Editor ──
+**/.vscode/*
+!**/.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.code-workspace
+
+# ── Agent skills cache (reinstallable via skills-lock.json — 3 copies ~4 MB, do NOT commit) ──
+.agents/
+.claude/
+agent/
+
+# ── Reference screenshots (5 MB, local only) ──
+app-image-examples/

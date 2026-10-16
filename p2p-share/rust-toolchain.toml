@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned per project plan (MSRV floor is 1.90 for the Tauri dialog plugin).
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
