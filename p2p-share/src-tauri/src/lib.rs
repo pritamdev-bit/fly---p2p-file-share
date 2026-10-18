@@ -1,14 +1,40 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
+mod diagnostics;
+mod events;
+mod transfer;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .manage(transfer::ShareState::default())
+        .setup(|app| {
+            // Real OS blur (Windows acrylic) so the desktop stays visible
+            // but unreadable behind the transparent window. Linux has no
+            // equivalent here and falls back to the CSS frost layer.
+            #[cfg(target_os = "windows")]
+            {
+                use tauri::{
+                    Manager,
+                    window::{Color, Effect, EffectState, EffectsBuilder},
+                };
+                let window = app.get_webview_window("main").unwrap();
+                window.set_effects(
+                    EffectsBuilder::new()
+                        .effect(Effect::Acrylic)
+                        .state(EffectState::Active)
+                        .color(Color(13, 20, 34, 160))
+                        .build(),
+                )?;
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            transfer::send_file,
+            transfer::receive_file,
+            transfer::stop_sharing,
+            diagnostics::get_diagnostics,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

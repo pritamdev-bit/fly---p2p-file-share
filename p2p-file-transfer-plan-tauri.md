@@ -77,8 +77,8 @@
 | P2P networking | `iroh` 1.x (1.3.0 observed; semver-stable) | Hole punching, relay fallback, encrypted QUIC connections; pin exact |
 | File transfer | `iroh-blobs` 0.x (0.103.1 observed) | BLAKE3 verified streaming, resume via persistent store; pin exact, changelog on every bump; production caveat means soak-test large transfers |
 | Reference code | `sendmer` 0.11.0 — **read-only** | **AGPL-3.0-only, single maintainer: do not copy its code or depend on the crate** in a closed app; reimplement its export/timeout patterns clean-room. Evaluate n0's `sendme` as the primary reference instead (verify license/state first — UNVERIFIED) |
-| File picker | Tauri dialog plugin | Needs `dialog:allow-open` + `dialog:allow-save`; requires Rust 1.90 or newer |
-| Copy ticket | Tauri clipboard plugin | First-party; works outside the webview sandbox |
+| File picker | Tauri dialog plugin | `@tauri-apps/plugin-dialog` + `tauri-plugin-dialog` (v2.8.3 observed); needs `dialog:allow-open` + `dialog:allow-save`; requires Rust 1.90 or newer |
+| Copy ticket | Tauri clipboard-manager plugin | `@tauri-apps/plugin-clipboard-manager` + `tauri-plugin-clipboard-manager` (v2.5.0 observed; note the `-manager` suffix — there is no `plugin-clipboard` package); first-party; works outside the webview sandbox |
 | Updates | Tauri updater plugin — **decision required before v1** | Signatures are mandatory; lose the signing key and you cannot publish updates |
 | Release trust | Sigstore/cosign + SBOM on GitHub releases | Independent of OS code signing |
 | Toolchain | `rust-toolchain.toml` + committed `Cargo.lock` + `cargo --locked` + `cargo audit` in CI | Reproducible, audited builds |
@@ -199,7 +199,7 @@ Notes from Tauri's docs (corrected):
 - Rust argument `on_event` becomes `onEvent` in the JS call.
 
 Tasks:
-- [ ] Send panel: pick a file (dialog plugin), show ticket + sender fingerprint, copy-ticket button (clipboard plugin), Stop sharing button, progress bar.
+- [ ] Send panel: pick a file (dialog plugin), show ticket + sender fingerprint, copy-ticket button (clipboard plugin), Stop sharing button, progress bar. Drag-and-drop a file onto the window works too (`tauri://drag-drop`, first file wins in v1).
 - [ ] Receive panel: paste a ticket, filename preview (from metadata in Phase 3; fake it now), pick save folder, progress bar.
 - [ ] Copy-diagnostics button (node ID, relay reachability, NAT type — never tickets or paths).
 - [ ] Fake the progress in Rust with a timer so you can finish the UI.
@@ -227,7 +227,7 @@ Rust tips:
 
 - [ ] **Resume:** persistent `FsStore` in the app data dir keyed by content hash, with TTL/pruning (e.g. 7 days). Interrupt a download, **restart the app**, paste the same ticket again — it continues instead of starting over. Test in-process retry separately from cross-process resume.
 - [ ] **Cancel** on both sides, and an idle-timeout-driven "sender went offline" message (a stalled transfer must never hang forever).
-- [ ] **Sender status:** show "waiting for receiver", "sending to a peer", "done" — and regenerate the displayed ticket when the endpoint's addresses change (tickets go stale).
+- [ ] **Sender status:** show "waiting for receiver", "sending to a peer", "done" — and regenerate the displayed ticket when the endpoint's addresses change (tickets go stale). Treat **receiver completion as the source of truth** for "done": Phase 1 showed a sender stuck at 1023/1024 MB after the receiver had fully completed, so `bytes_served == file_size` is never a reliable done-signal. Combine with idle detection + auto-stop.
 - [ ] **Copy ticket** button (clipboard plugin), QR code option, auto-clear the ticket display after use, and an in-app ticket inspector so users never paste live tickets into websites.
 - [ ] **Sender fingerprint confirm:** truncated node ID on both sides; document that the chat channel is part of the trust base.
 - [ ] **Disk space check** before downloading: budget roughly 2x the file size with copy-based export (blob copy + final file, plus ~6% BLAKE3 outboard at 1 KiB chunks) — or use `ExportMode::TryReference` and state the choice in the UI.
@@ -263,7 +263,7 @@ Rust tips:
 ## 6. Security checklist
 
 - [ ] **AGPL: `sendmer` is read-only.** No copied code, no dependency in a closed app. (If n0's `sendme` is adopted as the reference instead, verify its license/state first — UNVERIFIED.)
-- [ ] **Minimal Tauri surface:** `dialog:allow-open` + `dialog:allow-save` only (message dialogs need `dialog:allow-message`; `ask`/`confirm` are deprecated aliases), plus the clipboard allow for copy-ticket. **Never** add fs/opener/shell plugins — all file IO stays in Rust behind your commands. Scope app commands via `AppManifest::commands` only if a second window is ever added.
+- [ ] **Minimal Tauri surface:** `dialog:allow-open` + `dialog:allow-save` only (message dialogs need `dialog:allow-message`; `ask`/`confirm` are deprecated aliases), plus `clipboard-manager:allow-write-text` for copy-ticket. **Never** add fs/opener/shell plugins — all file IO stays in Rust behind your commands. Scope app commands via `AppManifest::commands` only if a second window is ever added.
 - [ ] The UI never passes arbitrary paths for the backend to read without the user having picked them in the dialog.
 - [ ] **Treat tickets as reusable bearer [REDACTED].** Anyone holding one can download, multiple times. Send only to the intended person; UI wording: forwarding = granting. Provide **Stop sharing** (closes the router) and auto-stop after the first completed download; consider a session-lifetime option. Tickets may reveal network addresses — don't post publicly, and warn users never to paste live tickets into ticket-inspector websites (ship an in-app inspector instead).
 - [ ] **Filenames and paths are hostile input:** validate every remote path component is `Component::Normal` (no `..`, absolute paths, or prefixes) — never `join()` a remote name onto the save dir unvalidated. Reject symlinks in remote metadata; use `symlink_metadata` (never follow destination links) before commit; commit with an atomic no-replace primitive. Filenames arrive inside the hashed collection, never as trusted chat text.
@@ -357,7 +357,7 @@ Pinned versions observed 2026-10-16 (re-check before building): `tauri` 2.12.4 �
 - **`sendmer` (READ-ONLY, AGPL-3.0-only):** README (cache-dir resume, ticket types, retry/timeouts, sender caps, `SendHandle`, Sigstore releases) and `receiver`/`endpoint`/`args` source — behavior spec only, never copied code.
 - **n0 `sendme`** current state and license as the alternative primary reference — **UNVERIFIED**, check before using.
 - **Tauri v2:** `#[tauri::command]`, single `generate_handler!`, `tauri::ipc::Channel` vs events for progress, `Channel` from `@tauri-apps/api/core`, state management (`app.manage`, `Mutex`), capabilities (app-commands default-allow, `AppManifest::commands`).
-- **Tauri plugins:** dialog (package/crate names, `allow-open`/`allow-save`, Rust 1.90+), clipboard, updater (mandatory signatures, key handling).
+- **Tauri plugins:** dialog (`@tauri-apps/plugin-dialog` / `tauri-plugin-dialog`, `allow-open`/`allow-save`, Rust 1.90+), clipboard-manager (`@tauri-apps/plugin-clipboard-manager` / `tauri-plugin-clipboard-manager`, `allow-write-text`), updater (mandatory signatures, key handling).
 - **Windows WebView2 install options** (bootstrapper table) and **Linux package dependencies** in the bundler docs; MSI-Windows-only constraint.
 - **OS filename rules** during Phase 4 (reserved names, ADS, trailing dots, non-UTF8) — **UNVERIFIED** in research, verify against platform docs.
 - The WebKitGTK-WebRTC background claim is likewise **UNVERIFIED** — but it doesn't affect the build (Rust networking stands on IPC cost, installer size, and the resume library).

@@ -1,51 +1,63 @@
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { APP_NAME } from "./api";
+import Diagnostics from "./components/Diagnostics";
+import ReceivePanel from "./components/ReceivePanel";
+import SendPanel from "./components/SendPanel";
+import { ArrowDownIcon, ArrowUpIcon, LogoMark } from "./components/icons";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+type View = "send" | "receive";
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+export default function App() {
+  const [view, setView] = useState<View>("send");
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+    <div className="app">
+      <aside className="sidebar">
+        <div className="brand">
+          <LogoMark />
+          <span className="brand-name">{APP_NAME}</span>
+        </div>
+        <nav className="nav" aria-label="Main">
+          <button
+            className={view === "send" ? "nav-item active" : "nav-item"}
+            onClick={() => setView("send")}
+          >
+            <ArrowUpIcon size={17} />
+            Send
+          </button>
+          <button
+            className={view === "receive" ? "nav-item active" : "nav-item"}
+            onClick={() => setView("receive")}
+          >
+            <ArrowDownIcon size={17} />
+            Receive
+          </button>
+        </nav>
+        <div className="sidebar-footer">
+          <div className="status-line">
+            <span className="status-dot" aria-hidden="true" />
+            <div>
+              <div className="status-title">Ready</div>
+              <div className="status-sub">Fake transfers · Phase 2</div>
+            </div>
+          </div>
+          <button
+            className="btn-ghost btn-small btn-block"
+            onClick={() => setDiagnosticsOpen(true)}
+          >
+            Diagnostics
+          </button>
+        </div>
+      </aside>
+      <main className="content">
+        {view === "send" ? <SendPanel /> : <ReceivePanel />}
+      </main>
+      <Diagnostics
+        open={diagnosticsOpen}
+        onClose={() => setDiagnosticsOpen(false)}
+      />
+    </div>
   );
 }
-
-export default App;
