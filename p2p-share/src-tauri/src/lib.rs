@@ -8,7 +8,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(transfer::ShareState::default())
-        .setup(|app| {
+        .setup(|_app| {
             // Real OS blur (Windows acrylic) so the desktop stays visible
             // but unreadable behind the transparent window. Linux has no
             // equivalent here and falls back to the CSS frost layer.
@@ -18,7 +18,7 @@ pub fn run() {
                     Manager,
                     window::{Color, Effect, EffectState, EffectsBuilder},
                 };
-                let window = app.get_webview_window("main").unwrap();
+                let window = _app.get_webview_window("main").unwrap();
                 window.set_effects(
                     EffectsBuilder::new()
                         .effect(Effect::Acrylic)

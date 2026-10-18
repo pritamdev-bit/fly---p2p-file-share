@@ -689,6 +689,12 @@ button:focus-visible {
   color: var(--text-dim);
 }
 
+/* Linux fallback: no OS acrylic, so the frost must be near-opaque on
+   its own. Windows keeps the lighter tint over real acrylic blur. */
+html.platform-linux body {
+  background: rgba(8, 13, 24, 0.86);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .progress-fill {
     transition: none;
