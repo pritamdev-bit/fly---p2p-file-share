@@ -1,114 +1,189 @@
-use crate::events::TransferEvent;
+//! Thin Tauri adapters over [`crate::share`] and [`crate::download`].
+//!
+//! These translate between IPC types (`Channel`, command args/results) and
+//! the core logic, which speaks only mpsc + anyhow and stays testable
+//! without a Tauri context.
+
+use crate::{
+    download,
+    events::TransferEvent,
+    share::{self, ShareSession, TicketType},
+};
 use serde::Serialize;
-use tauri::Manager;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tauri::ipc::Channel;
+use std::{path::Path, sync::Mutex};
+use tauri::{AppHandle, Manager, State, ipc::Channel};
+use tokio::sync::mpsc;
 
-/// Phase 2 fake of the share state. Phase 3 replaces the flag with the real
-/// serving session (endpoint/router + blob `Tag`) behind the same handle.
-#[derive(Default)]
-pub struct ShareState {
-    cancel_requested: AtomicBool,
-}
-
-impl ShareState {
-    fn request_cancel(&self) {
-        self.cancel_requested.store(true, Ordering::SeqCst);
-    }
-
-    fn reset(&self) {
-        self.cancel_requested.store(false, Ordering::SeqCst);
-    }
-
-    fn is_cancelled(&self) -> bool {
-        self.cancel_requested.load(Ordering::SeqCst)
-    }
-}
-
-/// What the UI needs after a share starts. Phase 3 fills both from real
-/// iroh state; the shape already matches the plan's flow.
+/// What the UI needs once a share starts.
 #[derive(Serialize)]
 pub struct ShareInfo {
     pub ticket: String,
     pub fingerprint: String,
 }
 
-/// Fake values until Phase 3 wires real iroh state.
-const FAKE_TICKET: &str = "FAKE-TICKET-p2p-share-phase2";
-const FAKE_FINGERPRINT: &str = "FAKE-FINGERPRINT-0123";
+enum ShareSlot {
+    Empty,
+    Starting { cancelled: bool },
+    Active(ShareSession),
+}
 
-/// Fake progress shape: 20 steps x 400 ms, about 8 seconds per transfer.
-const FAKE_STEPS: u64 = 20;
-const FAKE_STEP_DELAY: Duration = Duration::from_millis(400);
+impl Default for ShareSlot {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+#[derive(Default)]
+pub struct AppState {
+    /// Sync mutex, deliberately never held across `.await`
+    /// (short critical sections only).
+    share: Mutex<ShareSlot>,
+    /// Async mutex: held across the whole download on purpose, so a
+    /// second Start click fails fast instead of corrupting the cache.
+    receive_lock: tokio::sync::Mutex<()>,
+}
+
+fn spawn_forwarder(
+    mut events: mpsc::UnboundedReceiver<TransferEvent>,
+    channel: Channel<TransferEvent>,
+) {
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if channel.send(event).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn lock_share<'a>(state: &'a State<'a, AppState>) -> Result<std::sync::MutexGuard<'a, ShareSlot>, String> {
+    state.share.lock().map_err(|_| "internal state error".to_string())
+}
 
 #[tauri::command]
 pub async fn send_file(
-    app: tauri::AppHandle,
+    app: AppHandle,
     path: String,
+    ticket_type: String,
     on_event: Channel<TransferEvent>,
 ) -> Result<ShareInfo, String> {
-    if path.trim().is_empty() {
-        return Err("No file selected.".to_string());
-    }
-    // Phase 3: hash the file, start serving it, return ticket + fingerprint.
-    // For now: return the fake share immediately and stream fake progress
-    // from a background task, like the real serving loop will.
-    app.state::<ShareState>().reset();
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app_handle.state::<ShareState>();
-        let total = 100u64;
-        for step in 1..=FAKE_STEPS {
-            tokio::time::sleep(FAKE_STEP_DELAY).await;
-            if state.is_cancelled() {
-                let _ = on_event.send(TransferEvent::Failed {
-                    message: "Sharing stopped.".to_string(),
-                });
-                return;
+    let ticket_type = TicketType::parse(&ticket_type).map_err(|error| error.to_string())?;
+    let state = app.state::<AppState>();
+    {
+        let mut slot = lock_share(&state)?;
+        match *slot {
+            ShareSlot::Empty => *slot = ShareSlot::Starting { cancelled: false },
+            ShareSlot::Starting { .. } => {
+                return Err("A share is already starting. Stop it first.".to_string());
             }
-            let _ = on_event.send(TransferEvent::Progress {
-                done: step * total / FAKE_STEPS,
-                total,
-            });
+            ShareSlot::Active(_) => {
+                return Err("Already sharing a file. Stop sharing first.".to_string());
+            }
         }
-        let _ = on_event.send(TransferEvent::Finished);
-    });
-    Ok(ShareInfo {
-        ticket: FAKE_TICKET.to_string(),
-        fingerprint: FAKE_FINGERPRINT.to_string(),
-    })
+    }
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    spawn_forwarder(events_rx, on_event);
+    let started = share::start_share(Path::new(&path), ticket_type, events_tx).await;
+    // Decide under the lock; act after it. The sync guard must never be
+    // held across an `.await` (it is not `Send`).
+    enum PostStart {
+        Keep(ShareInfo),
+        Cancelled(ShareSession),
+        Failed(String),
+    }
+    let action = {
+        let mut slot = lock_share(&state)?;
+        match started {
+            Ok(started) => {
+                if matches!(*slot, ShareSlot::Starting { cancelled: true }) {
+                    *slot = ShareSlot::Empty;
+                    PostStart::Cancelled(started.session)
+                } else {
+                    let info = ShareInfo {
+                        ticket: started.ticket,
+                        fingerprint: started.fingerprint,
+                    };
+                    *slot = ShareSlot::Active(started.session);
+                    PostStart::Keep(info)
+                }
+            }
+            Err(error) => {
+                *slot = ShareSlot::Empty;
+                PostStart::Failed(format!("{error:#}"))
+            }
+        }
+    };
+    match action {
+        PostStart::Keep(info) => Ok(info),
+        PostStart::Cancelled(session) => {
+            session.shutdown().await;
+            Err("Sharing stopped.".to_string())
+        }
+        PostStart::Failed(message) => Err(message),
+    }
 }
 
 #[tauri::command]
 pub async fn receive_file(
+    app: AppHandle,
     ticket: String,
     save_dir: String,
     on_event: Channel<TransferEvent>,
 ) -> Result<String, String> {
-    if ticket.trim().is_empty() {
-        return Err("Paste a ticket first.".to_string());
-    }
-    if save_dir.trim().is_empty() {
-        return Err("Pick a save folder first.".to_string());
-    }
-    // Phase 3: parse the ticket, connect, download, export to save_dir.
-    // For now: fixed fake progress on the command task, then a fake name.
-    let total = 100u64;
-    for step in 1..=FAKE_STEPS {
-        tokio::time::sleep(FAKE_STEP_DELAY).await;
-        let _ = on_event.send(TransferEvent::Progress {
-            done: step * total / FAKE_STEPS,
-            total,
-        });
-    }
-    let _ = on_event.send(TransferEvent::Finished);
-    Ok("fake-download.bin".to_string())
+    let state = app.state::<AppState>();
+    let _guard = state
+        .receive_lock
+        .try_lock()
+        .map_err(|_| "A download is already running.".to_string())?;
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate app data: {error}"))?
+        .join("blobs");
+    let (events_tx, events_rx) = mpsc::unbounded_channel();
+    spawn_forwarder(events_rx, on_event);
+    download::receive(
+        &ticket,
+        Path::new(&save_dir),
+        &store_dir,
+        events_tx,
+    )
+    .await
+    .map_err(|error| format!("{error:#}"))
 }
 
 #[tauri::command]
-pub async fn stop_sharing(app: tauri::AppHandle) -> Result<String, String> {
-    // Phase 3: close the router (invalidates the ticket) and stop serving.
-    app.state::<ShareState>().request_cancel();
-    Ok("Sharing stopped.".to_string())
+pub async fn preview_ticket(app: AppHandle, ticket: String) -> Result<download::FilePreview, String> {
+    let store_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("cannot locate app data: {error}"))?
+        .join("blobs");
+    download::preview(&ticket, &store_dir)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+pub async fn stop_sharing(app: AppHandle) -> Result<String, String> {
+    // Take the session out under the lock; shut it down after. The sync
+    // guard must never be held across an `.await` (it is not `Send`).
+    let state = app.state::<AppState>();
+    let action = {
+        let mut slot = lock_share(&state)?;
+        match std::mem::replace(&mut *slot, ShareSlot::Empty) {
+            ShareSlot::Active(session) => Some(session),
+            ShareSlot::Starting { .. } => {
+                *slot = ShareSlot::Starting { cancelled: true };
+                return Ok("Stopping…".to_string());
+            }
+            ShareSlot::Empty => return Ok("Not sharing.".to_string()),
+        }
+    };
+    if let Some(session) = action {
+        session.shutdown().await;
+        Ok("Sharing stopped.".to_string())
+    } else {
+        Ok("Not sharing.".to_string())
+    }
 }

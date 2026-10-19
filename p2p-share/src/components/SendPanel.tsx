@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   copyText,
   fileNameOf,
@@ -7,12 +7,11 @@ import {
   sendFile,
   stopSharing,
 } from "../api";
-import type { ShareInfo, TransferEvent } from "../api";
+import type { ShareInfo, TicketType, TransferEvent } from "../api";
 import Fingerprint from "./Fingerprint";
-import Progress from "./Progress";
 import { AlertIcon, CheckIcon, CopyIcon, FileIcon, LockIcon } from "./icons";
 
-type Status = "idle" | "sharing" | "stopped" | "finished" | "error";
+type Status = "idle" | "preparing" | "sharing" | "stopped" | "error";
 
 function truncateMiddle(value: string, head = 14, tail = 10): string {
   if (value.length <= head + tail + 1) return value;
@@ -21,37 +20,35 @@ function truncateMiddle(value: string, head = 14, tail = 10): string {
 
 export default function SendPanel() {
   const [filePath, setFilePath] = useState<string | null>(null);
+  const [ticketType, setTicketType] = useState<TicketType>("id");
   const [share, setShare] = useState<ShareInfo | null>(null);
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(
-    null,
-  );
+  const [receivers, setReceivers] = useState(0);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [copied, setCopied] = useState(false);
   const [dragging, setDragging] = useState(false);
+  // The drop listener registers once; refs keep its checks current.
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const ticketTypeRef = useRef(ticketType);
+  ticketTypeRef.current = ticketType;
 
   function handleEvent(event: TransferEvent) {
-    if (event.event === "Progress") {
-      setProgress({ done: event.data.done, total: event.data.total });
-    } else if (event.event === "Finished") {
-      setStatus("finished");
-      setMessage("Transfer finished (fake).");
-    } else if (event.data.message === "Sharing stopped.") {
-      setStatus("stopped");
-      setMessage("Sharing stopped.");
-    } else {
-      setStatus("error");
-      setMessage(event.data.message);
+    // The sender only ever hears Sending: pulls are receiver-driven, so no
+    // sender-side progress exists, and v1 has no sender "done" signal.
+    if (event.event === "Sending") {
+      setReceivers(event.data.receivers);
     }
   }
 
-  async function startShare(path: string) {
-    setProgress(null);
+  async function startShare(path: string, kind: TicketType) {
+    setReceivers(0);
     setMessage("");
-    setStatus("sharing");
+    setStatus("preparing");
     try {
-      const info = await sendFile(path, handleEvent);
+      const info = await sendFile(path, kind, handleEvent);
       setShare(info);
+      setStatus("sharing");
     } catch (err) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
@@ -59,9 +56,12 @@ export default function SendPanel() {
   }
 
   async function sharePath(path: string) {
+    if (statusRef.current === "sharing" || statusRef.current === "preparing") {
+      return;
+    }
     setShare(null);
     setFilePath(path);
-    await startShare(path);
+    await startShare(path, ticketTypeRef.current);
   }
 
   async function handleChoose() {
@@ -88,7 +88,7 @@ export default function SendPanel() {
       })
       .catch(() => {});
     return () => unlisten?.();
-    // sharePath only uses setState + backend calls, so one registration is enough.
+    // sharePath reads statusRef + setState, so one registration is enough.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -115,6 +115,8 @@ export default function SendPanel() {
     }
   }
 
+  const busy = status === "sharing" || status === "preparing";
+
   return (
     <div className="view">
       <h1 className="view-title">Send a file</h1>
@@ -138,10 +140,47 @@ export default function SendPanel() {
             )}
           </div>
         </div>
-        <button className="btn-primary" onClick={handleChoose}>
-          {filePath ? "Choose another file" : "Choose a file"}
+        <button className="btn-primary" onClick={handleChoose} disabled={busy}>
+          {status === "preparing"
+            ? "Preparing…"
+            : filePath
+              ? "Choose another file"
+              : "Choose a file"}
         </button>
       </div>
+
+      {!busy && (
+        <div className="ticket-type-row">
+          <span className="ticket-type-label">Ticket type</span>
+          <div className="segmented" role="group" aria-label="Ticket type">
+            <button
+              className={ticketType === "id" ? "segmented-active" : ""}
+              onClick={() => setTicketType("id")}
+              title="Short ticket. Needs working discovery on the receiver's network."
+            >
+              Short
+            </button>
+            <button
+              className={ticketType === "full" ? "segmented-active" : ""}
+              onClick={() => setTicketType("full")}
+              title="Longer ticket. Use this if the short one can't connect."
+            >
+              Full
+            </button>
+          </div>
+          <span className="ticket-type-hint">
+            {ticketType === "id"
+              ? "Short ticket — try the full one if it can't connect."
+              : "Full ticket — works even where discovery is filtered."}
+          </span>
+        </div>
+      )}
+
+      {status === "preparing" && (
+        <div className="banner banner-info" role="status">
+          Preparing the file… (hashing, one moment)
+        </div>
+      )}
 
       {share && (
         <div className="share-grid">
@@ -165,7 +204,7 @@ export default function SendPanel() {
             <button
               className="btn-danger-outline btn-block"
               onClick={handleStop}
-              disabled={status === "stopped" || status === "finished"}
+              disabled={status === "stopped"}
             >
               Stop sharing
             </button>
@@ -173,19 +212,18 @@ export default function SendPanel() {
 
           <div className="card status-card">
             <h2 className="status-heading">
-              {status === "sharing" && "Waiting for receiver"}
-              {status === "finished" && "Transfer finished"}
+              {status === "sharing" && (receivers > 0 ? "Sending…" : "Waiting for receiver")}
               {status === "stopped" && "Sharing stopped"}
               {status === "error" && "Something went wrong"}
               {status === "idle" && "Ready"}
             </h2>
             <p className="card-sub">
-              {status === "sharing" && "Send the ticket to begin the transfer."}
-              {(status === "finished" || status === "stopped") && message}
+              {status === "sharing" &&
+                (receivers > 0
+                  ? `${receivers} receiver connected — keep this app open.`
+                  : "Send the ticket to begin the transfer.")}
+              {status === "stopped" && message}
             </p>
-            {progress && (status === "sharing" || status === "finished") && (
-              <Progress done={progress.done} total={progress.total} />
-            )}
             <div className="note-row">
               <LockIcon size={16} />
               <div>

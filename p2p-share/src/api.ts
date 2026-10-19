@@ -10,13 +10,22 @@ export const APP_NAME = "fly";
 /** Mirrors the Rust `TransferEvent` (adjacently tagged serde enum). */
 export type TransferEvent =
   | { event: "Progress"; data: { done: number; total: number } }
-  | { event: "Finished" }
-  | { event: "Failed"; data: { message: string } };
+  | { event: "Sending"; data: { receivers: number } }
+  | { event: "Finished" };
 
 /** Returned by `send_file`: what the UI needs once a share starts. */
 export interface ShareInfo {
   ticket: string;
   fingerprint: string;
+}
+
+/** `id`: short, needs working discovery. `full`: longer, works anywhere. */
+export type TicketType = "id" | "full";
+
+/** Returned by `preview_ticket`: the real name + size inside the ticket. */
+export interface FilePreview {
+  name: string;
+  size: number;
 }
 
 /** Returned by `get_diagnostics`. Never contains tickets or paths. */
@@ -64,12 +73,23 @@ export async function pickSaveDir(): Promise<string | null> {
 
 export function sendFile(
   path: string,
+  ticketType: TicketType,
   onMessage: (event: TransferEvent) => void,
 ): Promise<ShareInfo> {
   requireTauri();
   const onEvent = new Channel<TransferEvent>();
   onEvent.onmessage = onMessage;
-  return invoke<ShareInfo>("send_file", { path, onEvent });
+  return invoke<ShareInfo>("send_file", { path, ticketType, onEvent });
+}
+
+export function previewTicket(ticket: string): Promise<FilePreview> {
+  requireTauri();
+  return invoke<FilePreview>("preview_ticket", { ticket });
+}
+
+/** Tickets are one base32 word; chat apps may wrap them across lines. */
+export function normalizeTicket(ticket: string): string {
+  return ticket.replace(/\s+/g, "");
 }
 
 export function receiveFile(

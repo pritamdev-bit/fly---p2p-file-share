@@ -7,8 +7,11 @@ use serde::Serialize;
 #[serde(tag = "event", content = "data")]
 pub enum TransferEvent {
     Progress { done: u64, total: u64 },
+    /// Emitted whenever the sender-side receiver count changes (including
+    /// back to zero). Added in Phase 3; the plan expected it in Phase 4,
+    /// but real serving needs it the moment transfers are real.
+    Sending { receivers: u32 },
     Finished,
-    Failed { message: String },
-    // Phase 4 adds: WaitingForReceiver, Sending { receivers: u32 },
-    // fingerprint + diagnostics payloads.
+    // Failures travel as command `Err` strings, not events. Phase 4 may add:
+    // WaitingForReceiver, fingerprint + diagnostics payloads.
 }

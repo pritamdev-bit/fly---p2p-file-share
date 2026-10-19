@@ -1,6 +1,13 @@
-import { useState } from "react";
-import { pickSaveDir, receiveFile } from "../api";
-import type { TransferEvent } from "../api";
+import { useEffect, useState } from "react";
+import {
+  fileNameOf,
+  formatBytes,
+  normalizeTicket,
+  pickSaveDir,
+  previewTicket,
+  receiveFile,
+} from "../api";
+import type { FilePreview, TransferEvent } from "../api";
 import Progress from "./Progress";
 import {
   AlertIcon,
@@ -16,6 +23,9 @@ type Status = "idle" | "receiving" | "finished" | "error";
 export default function ReceivePanel() {
   const [ticket, setTicket] = useState("");
   const [saveDir, setSaveDir] = useState<string | null>(null);
+  const [preview, setPreview] = useState<FilePreview | null>(null);
+  const [previewError, setPreviewError] = useState("");
+  const [lookingUp, setLookingUp] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
@@ -23,14 +33,45 @@ export default function ReceivePanel() {
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
 
+  // Look up the real file name + size shortly after the ticket stops
+  // changing. An empty ticket clears the preview without a backend call.
+  useEffect(() => {
+    const value = normalizeTicket(ticket);
+    setPreview(null);
+    setPreviewError("");
+    if (value === "") {
+      setLookingUp(false);
+      return;
+    }
+    setLookingUp(true);
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      previewTicket(value)
+        .then((found) => {
+          if (cancelled) return;
+          setPreview(found);
+          setPreviewError("");
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setPreview(null);
+          setPreviewError(err instanceof Error ? err.message : String(err));
+        })
+        .finally(() => {
+          if (!cancelled) setLookingUp(false);
+        });
+    }, 600);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [ticket]);
+
   function handleEvent(event: TransferEvent) {
     if (event.event === "Progress") {
       setProgress({ done: event.data.done, total: event.data.total });
     } else if (event.event === "Finished") {
       setStatus("finished");
-    } else {
-      setStatus("error");
-      setMessage(event.data.message);
     }
   }
 
@@ -50,13 +91,20 @@ export default function ReceivePanel() {
     setMessage("");
     setStatus("receiving");
     try {
-      const name = await receiveFile(ticket.trim(), saveDir ?? "", handleEvent);
+      const name = await receiveFile(
+        normalizeTicket(ticket),
+        saveDir ?? "",
+        handleEvent,
+      );
       setSavedName(name);
     } catch (err) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
     }
   }
+
+  const canStart =
+    status !== "receiving" && normalizeTicket(ticket) !== "" && saveDir !== null;
 
   return (
     <div className="view">
@@ -83,13 +131,18 @@ export default function ReceivePanel() {
           spellCheck={false}
           autoComplete="off"
         />
-        {ticket.trim() !== "" && (
+        {normalizeTicket(ticket) !== "" && (
           <div className="preview-card">
-            <div className="preview-name">sample-document.pdf</div>
-            <div className="preview-sub">
-              Sample preview — the real file name arrives inside the ticket in
-              Phase 3.
-            </div>
+            {preview ? (
+              <>
+                <div className="preview-name">{fileNameOf(preview.name)}</div>
+                <div className="preview-sub">{formatBytes(preview.size)} — verified from the ticket.</div>
+              </>
+            ) : lookingUp ? (
+              <div className="preview-sub">Looking up the file…</div>
+            ) : previewError ? (
+              <div className="preview-error">{previewError}</div>
+            ) : null}
           </div>
         )}
         <div className="dir-row">
@@ -104,10 +157,13 @@ export default function ReceivePanel() {
         <button
           className="btn-primary btn-block btn-large"
           onClick={handleStart}
-          disabled={status === "receiving"}
+          disabled={!canStart}
         >
           Start receiving
         </button>
+        {status === "receiving" && !progress && (
+          <div className="connecting-hint">Connecting to the sender…</div>
+        )}
         {progress && (status === "receiving" || status === "finished") && (
           <div className="receive-progress">
             <Progress done={progress.done} total={progress.total} />
@@ -115,7 +171,7 @@ export default function ReceivePanel() {
         )}
         {status === "finished" && (
           <div className="banner banner-ok" role="status">
-            Saved{savedName ? ` as ${savedName}` : ""} (fake).
+            Saved{savedName ? ` as ${savedName}` : ""}.
           </div>
         )}
         {status === "error" && message && (

@@ -2,7 +2,7 @@
 
 **Goal:** A desktop app for Windows, Linux and macOS that sends a file of any size directly from one PC to another over the internet. Both PCs run the same app. Small installer, networking done in Rust.
 
-**In scope for v1:** one file at a time, send and receive in the same app, progress bar, integrity check, resume after a dropped connection, one receiver per ticket (serving auto-stops after the first completed download).
+**In scope for v1:** one file at a time, send and receive in the same app, progress bar, integrity check, resume after a dropped connection, max one *concurrent* receiver per ticket. (Serving does **not** auto-stop after a download in v1 — the sender stops it with **Stop sharing**. Auto-stop is deferred to Phase 4: the sender cannot reliably observe receiver completion, and Phase 1 proved `bytes_served` is not a done-signal.)
 
 **Out of scope for v1:** accounts, transfer history, mobile apps, multiple simultaneous transfers. (Folders are a possible stretch goal, see Phase 5. Same-network mDNS discovery is a later enhancement, deliberately off by default.)
 
@@ -34,7 +34,7 @@
 6. **Verified streaming:** the file is hashed in a tree (BLAKE3), so the receiver can check each piece as it arrives. This gives integrity checking and resume almost for free. Integrity covers only content **under the ticket's hash** — filenames must travel inside the hashed collection (see 8), never as side-channel chat text. (research issue 7)
 7. **Ticket:** one string that says "download this content from this peer." Full tickets are **long** (roughly 200 characters: endpoint ID + relay URL + direct addresses) — plan the UI for copy/QR, not transcription. Short **id-only** tickets plus live discovery are the QR-friendly default. Tickets are **reusable bearer [REDACTED]**: anyone holding one can download, multiple times; sharing a ticket shares your IP address; and the dialing info **goes stale** when networks change. (research issue 1, issue 2, V2, I7)
 8. **Filename transport (missing from the first draft):** `BlobTicket` has no filename field. Names travel in a **collection** (first element by convention an app-defined metadata blob), covered by the ticket's hash — including for v1 single-file shares. (research I1)
-9. **Stop sharing:** a ticket stays valid while the sender's router is alive. v1 has an explicit **Stop sharing** button (closes the router) and auto-stops serving after the first completed download. (research V2)
+9. **Stop sharing:** a ticket stays valid while the sender's router is alive. v1 stops serving only via the explicit **Stop sharing** button (closes the router) — there is no auto-stop after a download, so a ticket can be reused until stopped (that is also why §6 treats tickets as reusable bearer [REDACTED] regardless). Auto-stop arrives in Phase 4 combined with idle detection. (research V2)
 
 ---
 
@@ -56,7 +56,7 @@
 1. Sender picks a file. Rust imports it into a disk-backed store (report "Hashing..." for big files), keeps the blob `Tag` alive, and starts serving. The UI shows a **ticket** (id-only short form by default, full form when discovery is unavailable) plus a **sender fingerprint** for out-of-band verification.
 2. Sender gives the ticket to the receiver (any chat app, or QR). UI wording: forwarding the ticket = granting the download.
 3. Receiver pastes the ticket, sees the **filename from the hashed collection metadata**, and picks a save folder. Rust connects (relay on 443 must be reachable), downloads with connect/metadata/idle timeouts, exports through a validated staging pipeline, verifies, and saves.
-4. **The sender's app must stay open and the device awake** until the transfer finishes, because the receiver pulls the file from it. Serving stops automatically after the first completed download (one receiver per ticket); **Stop sharing** stops it sooner.
+4. **The sender's app must stay open and the device awake** until the transfer finishes, because the receiver pulls the file from it. Only one receiver at a time is served; serving continues until **Stop sharing** (no auto-stop in v1).
 
 | Part | Job |
 |---|---|
@@ -168,7 +168,8 @@ enum TransferEvent {
     Progress { done: u64, total: u64 },
     Finished,
     Failed { message: String },
-    // Phase 4 adds: WaitingForReceiver, Sending { receivers: u32 }, fingerprint + diagnostics payloads.
+    // Phase 3 added Sending { receivers: u32 } early (real serving needs it immediately).
+    // Phase 4 may add: WaitingForReceiver, fingerprint + diagnostics payloads.
 }
 
 #[tauri::command]
@@ -212,7 +213,7 @@ Tasks:
 
 Steps (follow the iroh quickstart and `sendmer` — read-only — for exact behavior at your pinned versions):
 - [ ] `send_file`: ephemeral key per launch (default); `FsStore` in the app data dir (never `MemStore` — flat memory depends on it); add the file via a **collection + metadata blob carrying the filename** (covered by the ticket hash — report "Hashing..." for big files); build the ticket (**id-only by default**, full form when discovery is unavailable); return ticket + fingerprint. Keep node/router **and the blob `Tag`** alive in managed state after the command returns. N0 preset (DNS/Pkarr only; DHT/mDNS off); UPnP per your pre-launch decision (proposal: disabled); `.proxy_from_env()` so proxy networks can reach a relay.
-- [ ] `receive_file`: parse the ticket, connect with explicit connect/metadata/idle timeouts, download, then export through the safety pipeline — staging dir, every path component must be `Component::Normal`, `symlink_metadata` exists-check, atomic no-replace commit per OS (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)` / `MoveFileExW` without replace), success only after the `Done` progress item. The filename comes from the hashed metadata, never from chat text. Enforce **max 1 concurrent receiver** sender-side; stop serving on completion.
+- [ ] `receive_file`: parse the ticket, connect with explicit connect/metadata/idle timeouts, download, then export through the safety pipeline — staging dir, every path component must be `Component::Normal`, `symlink_metadata` exists-check, atomic no-replace commit per OS (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)` / `MoveFileExW` without replace), success only after the `Done` progress item. The filename comes from the hashed metadata, never from chat text. Enforce **max 1 concurrent receiver** sender-side. (No stop-on-completion in v1 — see §1.9; deferred to Phase 4.)
 - [ ] Map the library's progress events (hashing, per-chunk, done/error) into your `TransferEvent` and send them through the channel.
 - [ ] Treat relay reachability on TCP 443 as a hard requirement; surface relay-vs-direct in diagnostics (UI badge later).
 - [ ] Shut the node down cleanly when the app closes, on cancel, and on Stop sharing (closes the router — invalidates the ticket).
@@ -223,11 +224,13 @@ Rust tips:
 
 **Done when:** two PCs on different networks transfer a 1 GB file through your UI with progress; the hash matches; the filename arrives via the ticket; Stop sharing invalidates the ticket; a second concurrent receiver is rejected.
 
+> **Phase 3 implementation notes (2026-10-19):** built as `src-tauri/src/{share,download,export,transfer}.rs` + `preview_ticket` command. Two gotchas worth keeping: (1) fetching the ticket hash as `HashSeq` recursively pulls **the entire file** — the filename preview and metadata path must request the collection root, its name-table blob, and the metadata blob each as `Raw` (three tiny fetches; covered by the `preview_does_not_download_file` regression test). (2) Each share mints a fresh ephemeral endpoint (stricter than the per-launch default in §1.5), so every ticket is independent. `Sending { receivers }` shipped early (see §5 sketch). Auto-stop deferred — see §1.9.
+
 ### Phase 4: Usability and reliability (about 1 week)
 
 - [ ] **Resume:** persistent `FsStore` in the app data dir keyed by content hash, with TTL/pruning (e.g. 7 days). Interrupt a download, **restart the app**, paste the same ticket again — it continues instead of starting over. Test in-process retry separately from cross-process resume.
 - [ ] **Cancel** on both sides, and an idle-timeout-driven "sender went offline" message (a stalled transfer must never hang forever).
-- [ ] **Sender status:** show "waiting for receiver", "sending to a peer", "done" — and regenerate the displayed ticket when the endpoint's addresses change (tickets go stale). Treat **receiver completion as the source of truth** for "done": Phase 1 showed a sender stuck at 1023/1024 MB after the receiver had fully completed, so `bytes_served == file_size` is never a reliable done-signal. Combine with idle detection + auto-stop.
+- [ ] **Sender status:** ~~show "waiting for receiver", "sending to a peer"~~ (done in Phase 3 via `Sending { receivers }`), still to do: "done" — and regenerate the displayed ticket when the endpoint's addresses change (tickets go stale). Treat **receiver completion as the source of truth** for "done": Phase 1 showed a sender stuck at 1023/1024 MB after the receiver had fully completed, so `bytes_served == file_size` is never a reliable done-signal. Combine with idle detection + auto-stop (the deferred v1 auto-stop lives here).
 - [ ] **Copy ticket** button (clipboard plugin), QR code option, auto-clear the ticket display after use, and an in-app ticket inspector so users never paste live tickets into websites.
 - [ ] **Sender fingerprint confirm:** truncated node ID on both sides; document that the chat channel is part of the trust base.
 - [ ] **Disk space check** before downloading: budget roughly 2x the file size with copy-based export (blob copy + final file, plus ~6% BLAKE3 outboard at 1 KiB chunks) — or use `ExportMode::TryReference` and state the choice in the UI.
@@ -265,12 +268,12 @@ Rust tips:
 - [ ] **AGPL: `sendmer` is read-only.** No copied code, no dependency in a closed app. (If n0's `sendme` is adopted as the reference instead, verify its license/state first — UNVERIFIED.)
 - [ ] **Minimal Tauri surface:** `dialog:allow-open` + `dialog:allow-save` only (message dialogs need `dialog:allow-message`; `ask`/`confirm` are deprecated aliases), plus `clipboard-manager:allow-write-text` for copy-ticket. **Never** add fs/opener/shell plugins — all file IO stays in Rust behind your commands. Scope app commands via `AppManifest::commands` only if a second window is ever added.
 - [ ] The UI never passes arbitrary paths for the backend to read without the user having picked them in the dialog.
-- [ ] **Treat tickets as reusable bearer [REDACTED].** Anyone holding one can download, multiple times. Send only to the intended person; UI wording: forwarding = granting. Provide **Stop sharing** (closes the router) and auto-stop after the first completed download; consider a session-lifetime option. Tickets may reveal network addresses — don't post publicly, and warn users never to paste live tickets into ticket-inspector websites (ship an in-app inspector instead).
+- [ ] **Treat tickets as reusable bearer [REDACTED].** Anyone holding one can download, multiple times. Send only to the intended person; UI wording: forwarding = granting. Provide **Stop sharing** (closes the router); auto-stop after a completed download is deferred to Phase 4; consider a session-lifetime option. Tickets may reveal network addresses — don't post publicly, and warn users never to paste live tickets into ticket-inspector websites (ship an in-app inspector instead).
 - [ ] **Filenames and paths are hostile input:** validate every remote path component is `Component::Normal` (no `..`, absolute paths, or prefixes) — never `join()` a remote name onto the save dir unvalidated. Reject symlinks in remote metadata; use `symlink_metadata` (never follow destination links) before commit; commit with an atomic no-replace primitive. Filenames arrive inside the hashed collection, never as trusted chat text.
 - [ ] Never auto-open a received file — and never preview one in the webview either.
 - [ ] Don't log tickets, file paths, or lower-level connection text — in app logs, crash reports, or the diagnostics bundle.
 - [ ] **Sender authentication:** fingerprint-confirm UX (truncated node ID on both sides); document that the chat channel is part of the trust base.
-- [ ] **Resource caps:** max 1 concurrent receiver in v1; stop serving on completion; consider max-upload-rate / session-lifetime / max-total-size options.
+- [ ] **Resource caps:** max 1 concurrent receiver in v1; stop-serving-on-completion deferred to Phase 4 (manual Stop sharing until then); consider max-upload-rate / session-lifetime / max-total-size options.
 - [ ] **Disclose relay/discovery metadata** in-app ("how private is this?"): relays see who exchanges traffic, when, and how much; endpoints auto-publish addressing info to lookup services. Mitigations: ephemeral identity default, paid/self-hosted relay, DHT/mDNS kept off and documented.
 - [ ] **UPnP/NAT-PMP:** disabled or disclosed — never silently reconfiguring the user's gateway.
 - [ ] **Clipboard hygiene:** prefer QR + in-app paste; auto-clear ticket displays; never log clipboard contents.
