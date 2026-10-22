@@ -41,6 +41,9 @@ pub struct AppState {
     /// Async mutex: held across the whole download on purpose, so a
     /// second Start click fails fast instead of corrupting the cache.
     receive_lock: tokio::sync::Mutex<()>,
+    /// Abort handle for the running download task, if any. Sync mutex,
+    /// short critical sections only — aborting is synchronous.
+    receive_cancel: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 fn spawn_forwarder(
@@ -142,14 +145,44 @@ pub async fn receive_file(
         .join("blobs");
     let (events_tx, events_rx) = mpsc::unbounded_channel();
     spawn_forwarder(events_rx, on_event);
-    download::receive(
-        &ticket,
-        Path::new(&save_dir),
-        &store_dir,
-        events_tx,
-    )
-    .await
-    .map_err(|error| format!("{error:#}"))
+    // The download runs as a task so `cancel_receive` can abort it. The
+    // lock stays in the command (not the task), so an abort can never
+    // leak it. Partial cache survives an abort and resumes next run.
+    let task = tokio::spawn(async move {
+        download::receive(&ticket, Path::new(&save_dir), &store_dir, events_tx).await
+    });
+    *state
+        .receive_cancel
+        .lock()
+        .map_err(|_| "internal state error".to_string())? = Some(task.abort_handle());
+    let result = task.await;
+    *state
+        .receive_cancel
+        .lock()
+        .map_err(|_| "internal state error".to_string())? = None;
+    match result {
+        Ok(Ok(name)) => Ok(name),
+        Ok(Err(error)) => Err(format!("{error:#}")),
+        Err(join) if join.is_cancelled() => Err("Download cancelled.".to_string()),
+        Err(join) => Err(format!("download task failed: {join}")),
+    }
+}
+
+#[tauri::command]
+pub async fn cancel_receive(app: AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let handle = state
+        .receive_cancel
+        .lock()
+        .map_err(|_| "internal state error".to_string())?
+        .take();
+    match handle {
+        Some(handle) => {
+            handle.abort();
+            Ok("Download cancelled.".to_string())
+        }
+        None => Ok("No download running.".to_string()),
+    }
 }
 
 #[tauri::command]

@@ -562,6 +562,41 @@ button:focus-visible {
   color: var(--text-dim);
 }
 
+/* Inactive tab: stays mounted (state survives switches), just not shown. */
+.view-hidden {
+  display: none;
+}
+
+.speed-line {
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.deliver-banner {
+  align-items: center;
+}
+
+.deliver-pop {
+  display: inline-flex;
+  animation: deliver-pop 0.55s cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+
+@keyframes deliver-pop {
+  0% {
+    transform: scale(0.2);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.3);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
 .ticket-type-row {
   display: flex;
   align-items: center;

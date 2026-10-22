@@ -12,7 +12,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_blobs::{
-    BlobFormat, BlobsProtocol,
+    BlobFormat, BlobsProtocol, Hash,
     api::{
         Store, TempTag,
         blobs::{AddPathOptions, AddProgressItem, ImportMode},
@@ -35,6 +35,11 @@ use tokio::sync::{Semaphore, mpsc};
 
 /// Collection key for the filename/size metadata blob (always first).
 pub const METADATA_NAME: &str = "fly-metadata.json";
+
+/// ALPN for the completion ping: after a successful export, the receiver
+/// dials this, sends the 32 collection-hash bytes on one uni stream, and
+/// closes. Anything else on this ALPN is ignored.
+pub(crate) const DONE_ALPN: &[u8] = b"fly/done/0";
 
 /// Filename + size carried inside the hashed collection, so the receiver
 /// learns the real name from the ticket instead of trusting chat text.
@@ -126,6 +131,46 @@ impl ProtocolHandler for CappedProtocol {
     }
 }
 
+/// Handler for the completion ping ([`DONE_ALPN`]). Expects exactly the
+/// 32 collection-hash bytes, then acknowledges with one byte so the
+/// receiver knows the ping landed before it tears down. Anything else is
+/// ignored. Never counted as a receiver and never fails the share.
+struct DoneHandler {
+    expected: Hash,
+    events: mpsc::UnboundedSender<TransferEvent>,
+}
+
+impl std::fmt::Debug for DoneHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DoneHandler").finish_non_exhaustive()
+    }
+}
+
+impl ProtocolHandler for DoneHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let outcome: Result<()> = async {
+            let (mut send, mut recv) = connection.accept_bi().await.context("no ping stream")?;
+            let bytes = recv.read_to_end(64).await.context("unreadable ping")?;
+            if bytes.len() == 32 {
+                let mut raw = [0u8; 32];
+                raw.copy_from_slice(&bytes);
+                if Hash::from_bytes(raw) == self.expected {
+                    let _ = self.events.send(TransferEvent::Delivered);
+                }
+            }
+            // Always ack (even on mismatch) so the receiver never hangs.
+            send.write_all(b"1").await.context("ack write failed")?;
+            send.finish().context("ack finish failed")?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            eprintln!("fly: bad completion ping: {error:#}");
+        }
+        Ok(())
+    }
+}
+
 /// Build a fresh ephemeral endpoint: N0 preset (DNS/Pkarr discovery only,
 /// no DHT/mDNS), default relay map, proxy from environment, no UPnP
 /// gateway probing (pre-launch proposal: disabled).
@@ -136,7 +181,10 @@ impl ProtocolHandler for CappedProtocol {
 pub(crate) async fn build_endpoint() -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(SecretKey::generate())
-        .alpns(vec![iroh_blobs::protocol::ALPN.to_vec()])
+        .alpns(vec![
+            iroh_blobs::protocol::ALPN.to_vec(),
+            DONE_ALPN.to_vec(),
+        ])
         .relay_mode(RelayMode::Default)
         .proxy_from_env()
         .portmapper_config(PortmapperConfig::Disabled)
@@ -172,7 +220,7 @@ pub async fn start_share(
     let gate = Arc::new(ConnectionGate {
         semaphore: Semaphore::new(1),
         active: AtomicU32::new(0),
-        events,
+        events: events.clone(),
     });
     let protocol = BlobsProtocol::new(&store, None);
     let router = Router::builder(endpoint.clone())
@@ -181,6 +229,13 @@ pub async fn start_share(
             CappedProtocol {
                 inner: protocol,
                 gate,
+            },
+        )
+        .accept(
+            DONE_ALPN,
+            DoneHandler {
+                expected: tag.hash(),
+                events,
             },
         )
         .spawn();

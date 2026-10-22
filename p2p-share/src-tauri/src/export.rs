@@ -74,6 +74,25 @@ fn cleanup_staging(dir: &Path) {
     }
 }
 
+/// Remove staging dirs left behind by a cancelled receive. Only true
+/// directories with our prefix are touched; anything else is left alone.
+/// Safe because only one receive runs at a time (receive_lock).
+fn cleanup_stale_staging(output_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(output_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with(".fly-stage-") {
+            continue;
+        }
+        // file_type() never follows symlinks: a symlink with our prefix
+        // is not our dir, so it is never removed.
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            cleanup_staging(&entry.path());
+        }
+    }
+}
+
 async fn export_to_staging(db: &Store, hash: Hash, staged_target: &Path) -> Result<()> {
     let export = db.export_with_opts(ExportOptions {
         hash,
@@ -104,6 +123,7 @@ pub async fn export_file(
     if !output_dir.is_dir() {
         bail!("save path is not a folder");
     }
+    cleanup_stale_staging(output_dir);
     let target = output_dir.join(file_name);
     ensure_absent(&target)?;
     let staging = staging_dir(output_dir)?;

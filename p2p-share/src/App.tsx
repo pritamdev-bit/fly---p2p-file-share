@@ -40,7 +40,7 @@ export default function App() {
             <span className="status-dot" aria-hidden="true" />
             <div>
               <div className="status-title">Ready</div>
-              <div className="status-sub">Fake transfers · Phase 2</div>
+              <div className="status-sub">Direct device-to-device</div>
             </div>
           </div>
           <button
@@ -52,7 +52,16 @@ export default function App() {
         </div>
       </aside>
       <main className="content">
-        {view === "send" ? <SendPanel /> : <ReceivePanel />}
+        {/* Both panels stay mounted so tab switches never lose state
+            (ticket, progress, in-flight transfers). The inactive one is
+            hidden with CSS; each panel gates tab-specific listeners on
+            its `active` prop. */}
+        <div className={view === "send" ? "" : "view-hidden"}>
+          <SendPanel active={view === "send"} />
+        </div>
+        <div className={view === "receive" ? "" : "view-hidden"}>
+          <ReceivePanel active={view === "receive"} />
+        </div>
       </main>
       <Diagnostics
         open={diagnosticsOpen}

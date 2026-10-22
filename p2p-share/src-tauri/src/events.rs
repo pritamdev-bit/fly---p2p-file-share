@@ -12,6 +12,10 @@ pub enum TransferEvent {
     /// but real serving needs it the moment transfers are real.
     Sending { receivers: u32 },
     Finished,
+    /// Sender-side only: the receiver finished the download and told us.
+    /// Arrives over a tiny second protocol after export, best-effort —
+    /// absence of this event does not mean the transfer failed.
+    Delivered,
     // Failures travel as command `Err` strings, not events. Phase 4 may add:
     // WaitingForReceiver, fingerprint + diagnostics payloads.
 }

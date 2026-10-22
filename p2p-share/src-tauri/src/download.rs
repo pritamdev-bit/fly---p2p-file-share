@@ -7,10 +7,10 @@
 use crate::{
     events::TransferEvent,
     export::{export_file, validate_single_segment},
-    share::{METADATA_NAME, ShareMetadata, build_endpoint},
+    share::{DONE_ALPN, METADATA_NAME, ShareMetadata, build_endpoint},
 };
 use anyhow::{Context, Result, anyhow, bail};
-use iroh::{Endpoint, endpoint::Connection};
+use iroh::{Endpoint, EndpointAddr, endpoint::Connection};
 use iroh_blobs::{
     BlobFormat, BlobsProtocol, Hash,
     api::{Store, remote::GetProgressItem},
@@ -28,17 +28,21 @@ use tokio::{sync::mpsc, time::timeout};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// The completion ping is a courtesy: quick timeout, never fails the run.
+const DONE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Same-process retry reuses already-downloaded ranges automatically.
+/// Attempts after the first reconnect, so a network switch can recover.
 const RETRY_LIMIT: u32 = 3;
-const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// What a ticket points at, with the connection ready to pull from.
 struct TicketTarget {
     endpoint: Endpoint,
+    sender: EndpointAddr,
     store: Store,
     _protocol: BlobsProtocol,
     connection: Connection,
+    collection: Hash,
     file_name: String,
     file_hash: Hash,
     total: u64,
@@ -67,9 +71,10 @@ async fn connect_and_describe(ticket_text: &str, store_dir: &Path) -> Result<Tic
     let _protocol = BlobsProtocol::new(&store, None);
     // Full-ticket relay/direct addresses are used as-is; id-only tickets
     // resolve through discovery (DNS/Pkarr).
+    let sender = ticket.addr().clone();
     let connection = timeout(
         CONNECT_TIMEOUT,
-        endpoint.connect(ticket.addr().clone(), iroh_blobs::protocol::ALPN),
+        endpoint.connect(sender.clone(), iroh_blobs::protocol::ALPN),
     )
     .await
     .map_err(|_| {
@@ -87,9 +92,11 @@ async fn connect_and_describe(ticket_text: &str, store_dir: &Path) -> Result<Tic
         describe_collection(&collection, &store, &remote, &connection).await?;
     Ok(TicketTarget {
         endpoint,
+        sender,
         store,
         _protocol,
         connection,
+        collection: ticket.hash(),
         file_name,
         file_hash,
         total,
@@ -116,19 +123,39 @@ pub async fn receive(
     events: mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<String> {
     let target = connect_and_describe(ticket_text, store_dir).await?;
-    let remote = target.store.remote();
-    download_with_retry(
-        &remote,
-        &target.connection,
-        target.file_hash,
-        target.total,
-        &events,
-    )
-    .await?;
+    download_with_retry(&target, &events).await?;
     export_file(&target.store, target.file_hash, &target.file_name, save_dir).await?;
+    // Tell the sender "I got it". Best-effort: a failure here (sender
+    // already stopped sharing, network gone) must not fail the receive.
+    notify_sender(&target.endpoint, &target.sender, target.collection).await;
     let _ = events.send(TransferEvent::Finished);
     target.endpoint.close().await;
     Ok(target.file_name)
+}
+
+/// Dial the sender's completion-ping protocol and send the collection
+/// hash (which identifies the share). Best-effort by design: the result
+/// is deliberately ignored.
+async fn notify_sender(endpoint: &Endpoint, sender: &EndpointAddr, collection: Hash) {
+    let ping = async {
+        let connection = endpoint
+            .connect(sender.clone(), DONE_ALPN)
+            .await
+            .context("done-ping connect failed")?;
+        let (mut send, mut recv) = connection.open_bi().await.context("no ping stream")?;
+        send.write_all(collection.as_bytes())
+            .await
+            .context("ping write failed")?;
+        send.finish().context("ping finish failed")?;
+        // Wait for the ack: it proves the sender processed the ping
+        // before we tear the endpoint down.
+        let mut ack = [0u8; 1];
+        recv.read_exact(&mut ack).await.context("no ping ack")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    if timeout(DONE_TIMEOUT, ping).await.is_err() {
+        eprintln!("fly: completion ping timed out");
+    }
 }
 
 /// Fetch one blob fully, ignoring progress (for small metadata).
@@ -214,16 +241,34 @@ async fn describe_collection(
 /// Fetch the file blob with progress, retrying transient failures.
 /// Already-downloaded ranges are reused on retry automatically.
 async fn download_with_retry(
-    remote: &iroh_blobs::api::remote::Remote,
-    connection: &Connection,
-    hash: Hash,
-    total: u64,
+    target: &TicketTarget,
     events: &mpsc::UnboundedSender<TransferEvent>,
 ) -> Result<()> {
+    let remote = target.store.remote();
+    let (hash, total) = (target.file_hash, target.total);
     let mut attempt = 0u32;
     let mut done = 0u64;
     loop {
         attempt += 1;
+        // Attempt 1 reuses the metadata connection. Later attempts dial
+        // fresh: after a network change the old connection is dead, and
+        // retrying on it would fail every time.
+        let fresh: Option<Connection> = if attempt == 1 {
+            None
+        } else {
+            Some(
+                timeout(
+                    CONNECT_TIMEOUT,
+                    target
+                        .endpoint
+                        .connect(target.sender.clone(), iroh_blobs::protocol::ALPN),
+                )
+                .await
+                .map_err(|_| anyhow!("Couldn't reach the sender (reconnect timed out)."))?
+                .context("Couldn't reach the sender")?,
+            )
+        };
+        let connection = fresh.as_ref().unwrap_or(&target.connection);
         let progress = remote.fetch(connection.clone(), (hash, BlobFormat::Raw));
         let mut stream = progress.stream();
         let mut failed: Option<anyhow::Error> = None;
@@ -259,7 +304,8 @@ async fn download_with_retry(
         if attempt >= RETRY_LIMIT {
             return Err(failed.unwrap_or_else(|| anyhow!("download failed")));
         }
-        tokio::time::sleep(RETRY_BACKOFF).await;
+        // Back off between attempts: a network switch needs a moment.
+        tokio::time::sleep(Duration::from_secs(2 * attempt as u64)).await;
     }
     let _ = events.send(TransferEvent::Progress { done: total, total });
     Ok(())
@@ -292,7 +338,7 @@ mod tests {
         let content: Vec<u8> = (0..65536u32).map(|i| (i.wrapping_mul(7)) as u8).collect();
         std::fs::write(src_dir.join("input.bin"), &content).unwrap();
 
-        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel();
         let started = share::start_share(
             &src_dir.join("input.bin"),
             share::TicketType::Full,
@@ -309,6 +355,23 @@ mod tests {
             std::fs::read(out_dir.join("input.bin")).unwrap(),
             content
         );
+        // The receiver must tell the sender it finished.
+        let mut delivered = false;
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+        while !delivered {
+            tokio::select! {
+                event = send_rx.recv() => {
+                    match event {
+                        Some(TransferEvent::Delivered) => delivered = true,
+                        None => break,
+                        _ => {}
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+        assert!(delivered, "sender never received the completion ping");
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }

@@ -11,14 +11,14 @@ import type { ShareInfo, TicketType, TransferEvent } from "../api";
 import Fingerprint from "./Fingerprint";
 import { AlertIcon, CheckIcon, CopyIcon, FileIcon, LockIcon } from "./icons";
 
-type Status = "idle" | "preparing" | "sharing" | "stopped" | "error";
+type Status = "idle" | "preparing" | "sharing" | "delivered" | "stopped" | "error";
 
 function truncateMiddle(value: string, head = 14, tail = 10): string {
   if (value.length <= head + tail + 1) return value;
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
 }
 
-export default function SendPanel() {
+export default function SendPanel({ active }: { active: boolean }) {
   const [filePath, setFilePath] = useState<string | null>(null);
   const [ticketType, setTicketType] = useState<TicketType>("id");
   const [share, setShare] = useState<ShareInfo | null>(null);
@@ -32,12 +32,16 @@ export default function SendPanel() {
   statusRef.current = status;
   const ticketTypeRef = useRef(ticketType);
   ticketTypeRef.current = ticketType;
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   function handleEvent(event: TransferEvent) {
-    // The sender only ever hears Sending: pulls are receiver-driven, so no
-    // sender-side progress exists, and v1 has no sender "done" signal.
+    // The sender only ever hears Sending + Delivered: pulls are
+    // receiver-driven, so no sender-side progress exists.
     if (event.event === "Sending") {
       setReceivers(event.data.receivers);
+    } else if (event.event === "Delivered") {
+      setStatus("delivered");
     }
   }
 
@@ -56,7 +60,13 @@ export default function SendPanel() {
   }
 
   async function sharePath(path: string) {
-    if (statusRef.current === "sharing" || statusRef.current === "preparing") {
+    // Drops land on the hidden panel too — ignore them unless visible.
+    if (!activeRef.current) return;
+    if (
+      statusRef.current === "sharing" ||
+      statusRef.current === "preparing" ||
+      statusRef.current === "delivered"
+    ) {
       return;
     }
     setShare(null);
@@ -115,7 +125,8 @@ export default function SendPanel() {
     }
   }
 
-  const busy = status === "sharing" || status === "preparing";
+  const busy =
+    status === "sharing" || status === "preparing" || status === "delivered";
 
   return (
     <div className="view">
@@ -213,6 +224,7 @@ export default function SendPanel() {
           <div className="card status-card">
             <h2 className="status-heading">
               {status === "sharing" && (receivers > 0 ? "Sending…" : "Waiting for receiver")}
+              {status === "delivered" && "Download complete"}
               {status === "stopped" && "Sharing stopped"}
               {status === "error" && "Something went wrong"}
               {status === "idle" && "Ready"}
@@ -222,8 +234,18 @@ export default function SendPanel() {
                 (receivers > 0
                   ? `${receivers} receiver connected — keep this app open.`
                   : "Send the ticket to begin the transfer.")}
+              {status === "delivered" &&
+                "The receiver got the file. The ticket stays valid until you stop sharing."}
               {status === "stopped" && message}
             </p>
+            {status === "delivered" && (
+              <div className="banner banner-ok deliver-banner" role="status">
+                <span className="deliver-pop" aria-hidden="true">
+                  <CheckIcon size={20} />
+                </span>
+                Delivered — you can stop sharing now.
+              </div>
+            )}
             <div className="note-row">
               <LockIcon size={16} />
               <div>

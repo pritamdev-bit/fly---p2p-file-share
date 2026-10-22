@@ -228,14 +228,14 @@ Rust tips:
 
 ### Phase 4: Usability and reliability (about 1 week)
 
-- [ ] **Resume:** persistent `FsStore` in the app data dir keyed by content hash, with TTL/pruning (e.g. 7 days). Interrupt a download, **restart the app**, paste the same ticket again — it continues instead of starting over. Test in-process retry separately from cross-process resume.
-- [ ] **Cancel** on both sides, and an idle-timeout-driven "sender went offline" message (a stalled transfer must never hang forever).
-- [ ] **Sender status:** ~~show "waiting for receiver", "sending to a peer"~~ (done in Phase 3 via `Sending { receivers }`), still to do: "done" — and regenerate the displayed ticket when the endpoint's addresses change (tickets go stale). Treat **receiver completion as the source of truth** for "done": Phase 1 showed a sender stuck at 1023/1024 MB after the receiver had fully completed, so `bytes_served == file_size` is never a reliable done-signal. Combine with idle detection + auto-stop (the deferred v1 auto-stop lives here).
-- [ ] **Copy ticket** button (clipboard plugin), QR code option, auto-clear the ticket display after use, and an in-app ticket inspector so users never paste live tickets into websites.
+- [ ] **Resume:** persistent `FsStore` in the app data dir keyed by content hash, with TTL/pruning (e.g. 7 days). Interrupt a download, **restart the app**, paste the same ticket again — it continues instead of starting over. Test in-process retry separately from cross-process resume. (In-process recovery already shipped: attempts after the first dial a fresh connection, so a receiver-side network switch can recover without restarting; cancel-then-Start resumes from the surviving cache.)
+- [ ] ~~**Cancel** on both sides~~ (shipped early: receiver Cancel aborts the task and keeps ticket + folder so Start resumes from the surviving cache; sender side is Stop sharing) — still to do: an idle-timeout-driven "sender went offline" message (a stalled transfer must never hang forever).
+- [ ] **Sender status:** ~~show "waiting for receiver", "sending to a peer"~~ (done in Phase 3 via `Sending { receivers }`), ~~"done"~~ (done for real: after export the receiver dials back over a tiny `fly/done/0` protocol and the sender shows a Delivered celebration — no idle heuristics needed) — still to do: regenerate the displayed ticket when the endpoint's addresses change (tickets go stale), plus the deferred auto-stop. (The old idle-detection "done" plan is obsolete: receiver completion now arrives as an explicit signal, which is what Phase 1's stuck-sender evidence always pointed at.)
+- [ ] **Copy ticket** button (clipboard plugin), QR code option, auto-clear the ticket display after use, and an in-app ticket inspector so users never paste live tickets into websites. (Decided 2026-10-22: `fly://` deeplinks that open straight into Receive ship together with QR here — the QR encodes the deeplink.)
 - [ ] **Sender fingerprint confirm:** truncated node ID on both sides; document that the chat channel is part of the trust base.
 - [ ] **Disk space check** before downloading: budget roughly 2x the file size with copy-based export (blob copy + final file, plus ~6% BLAKE3 outboard at 1 KiB chunks) — or use `ExportMode::TryReference` and state the choice in the UI.
 - [ ] **Duplicate filenames:** `file (1).zip` UX on top of an atomic no-replace commit (check-then-rename in two steps is racy).
-- [ ] **Speed and time remaining** in the progress UI.
+- [ ] ~~**Speed** and time remaining in the progress UI.~~ (speed shipped early: overall average on Receive) — time remaining still to do.
 - [ ] **OS filename rules pass:** reserved names, ADS colons, trailing dots, non-UTF8 — verify against platform docs (UNVERIFIED in research).
 - [ ] **Sleep:** "keep this device awake" wording (QUIC connections do not survive sleep); resume-after-sleep goes in the test matrix.
 - [ ] **Errors:** friendly messages for a bad ticket; "works with full ticket, fails with short ticket" pointing at DNS filtering; proxy/relay unreachable; UDP-blocked relay-only note; guidance for users who clicked Cancel on the firewall prompt.
@@ -246,7 +246,7 @@ Rust tips:
 - [ ] **Folders:** collections support them with the same libraries; reimplement the pattern from the read-only reference.
 - [ ] **Accept/reject on the sender side:** not possible with the simple pull model. This is the main reason to consider approach B.
 - [ ] **Same-network mDNS fast path:** skip public discovery on the LAN. Deliberately off by default (privacy); a later enhancement.
-- [ ] **Nicer tickets:** QR code, session-lifetime option, receiver/rate/size caps as options.
+- [ ] **Nicer tickets:** QR code, session-lifetime option, receiver/rate/size caps as options. (Short numeric codes rejected for v1: they need a rendezvous server mapping codes to tickets, with abuse-control and metadata-privacy costs out of proportion to the convenience.)
 - [ ] **Sigstore + SBOM** on GitHub releases, if not done in Phase 6.
 
 ### Phase 6: Package and ship (about 1 week)

@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  cancelReceive,
   fileNameOf,
   formatBytes,
+  formatSpeed,
   normalizeTicket,
   pickSaveDir,
   previewTicket,
@@ -20,7 +22,7 @@ import {
 
 type Status = "idle" | "receiving" | "finished" | "error";
 
-export default function ReceivePanel() {
+export default function ReceivePanel({ active }: { active: boolean }) {
   const [ticket, setTicket] = useState("");
   const [saveDir, setSaveDir] = useState<string | null>(null);
   const [preview, setPreview] = useState<FilePreview | null>(null);
@@ -29,13 +31,19 @@ export default function ReceivePanel() {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(
     null,
   );
+  const [speed, setSpeed] = useState<number | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
+  // Speed is the overall average since the first progress event — stable,
+  // and honest across stalls and retries.
+  const speedStart = useRef<{ at: number; done: number } | null>(null);
 
   // Look up the real file name + size shortly after the ticket stops
   // changing. An empty ticket clears the preview without a backend call.
+  // Skipped while the tab is hidden; re-runs when it becomes visible.
   useEffect(() => {
+    if (!active) return;
     const value = normalizeTicket(ticket);
     setPreview(null);
     setPreviewError("");
@@ -65,11 +73,22 @@ export default function ReceivePanel() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [ticket]);
+  }, [ticket, active]);
 
   function handleEvent(event: TransferEvent) {
     if (event.event === "Progress") {
-      setProgress({ done: event.data.done, total: event.data.total });
+      const { done, total } = event.data;
+      setProgress({ done, total });
+      const now = performance.now();
+      if (!speedStart.current) {
+        speedStart.current = { at: now, done };
+        setSpeed(null);
+      } else {
+        const elapsed = (now - speedStart.current.at) / 1000;
+        if (elapsed > 0.5) {
+          setSpeed((done - speedStart.current.done) / elapsed);
+        }
+      }
     } else if (event.event === "Finished") {
       setStatus("finished");
     }
@@ -87,6 +106,8 @@ export default function ReceivePanel() {
 
   async function handleStart() {
     setProgress(null);
+    setSpeed(null);
+    speedStart.current = null;
     setSavedName(null);
     setMessage("");
     setStatus("receiving");
@@ -97,6 +118,23 @@ export default function ReceivePanel() {
         handleEvent,
       );
       setSavedName(name);
+    } catch (err) {
+      const text = err instanceof Error ? err.message : String(err);
+      if (text === "Download cancelled.") {
+        // User-initiated: back to idle with a neutral note, keeping the
+        // ticket + folder so Start resumes from the surviving cache.
+        setStatus("idle");
+        setMessage("Download cancelled. Start again to resume.");
+      } else {
+        setStatus("error");
+        setMessage(text);
+      }
+    }
+  }
+
+  async function handleCancel() {
+    try {
+      await cancelReceive();
     } catch (err) {
       setStatus("error");
       setMessage(err instanceof Error ? err.message : String(err));
@@ -154,24 +192,41 @@ export default function ReceivePanel() {
             {saveDir ?? "No folder chosen"}
           </span>
         </div>
-        <button
-          className="btn-primary btn-block btn-large"
-          onClick={handleStart}
-          disabled={!canStart}
-        >
-          Start receiving
-        </button>
+        {status === "receiving" ? (
+          <button
+            className="btn-danger-outline btn-block btn-large"
+            onClick={handleCancel}
+          >
+            Cancel download
+          </button>
+        ) : (
+          <button
+            className="btn-primary btn-block btn-large"
+            onClick={handleStart}
+            disabled={!canStart}
+          >
+            Start receiving
+          </button>
+        )}
         {status === "receiving" && !progress && (
           <div className="connecting-hint">Connecting to the sender…</div>
         )}
         {progress && (status === "receiving" || status === "finished") && (
           <div className="receive-progress">
             <Progress done={progress.done} total={progress.total} />
+            {speed !== null && (
+              <div className="speed-line">{formatSpeed(speed)}</div>
+            )}
           </div>
         )}
         {status === "finished" && (
           <div className="banner banner-ok" role="status">
             Saved{savedName ? ` as ${savedName}` : ""}.
+          </div>
+        )}
+        {status === "idle" && message && (
+          <div className="banner banner-info" role="status">
+            {message}
           </div>
         )}
         {status === "error" && message && (

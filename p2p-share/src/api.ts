@@ -11,7 +11,8 @@ export const APP_NAME = "fly";
 export type TransferEvent =
   | { event: "Progress"; data: { done: number; total: number } }
   | { event: "Sending"; data: { receivers: number } }
-  | { event: "Finished" };
+  | { event: "Finished" }
+  | { event: "Delivered" };
 
 /** Returned by `send_file`: what the UI needs once a share starts. */
 export interface ShareInfo {
@@ -106,6 +107,16 @@ export function receiveFile(
 export function stopSharing(): Promise<string> {
   requireTauri();
   return invoke<string>("stop_sharing");
+}
+
+export function cancelReceive(): Promise<string> {
+  requireTauri();
+  return invoke<string>("cancel_receive");
+}
+
+export function formatSpeed(bytesPerSecond: number): string {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "—";
+  return `${formatBytes(Math.round(bytesPerSecond))}/s`;
 }
 
 export function fetchDiagnostics(): Promise<DiagnosticsInfo> {
