@@ -35,6 +35,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [savedName, setSavedName] = useState<string | null>(null);
+  const [resumable, setResumable] = useState(false);
   // Speed is the overall average since the first progress event — stable,
   // and honest across stalls and retries.
   const speedStart = useRef<{ at: number; done: number } | null>(null);
@@ -91,6 +92,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       }
     } else if (event.event === "Finished") {
       setStatus("finished");
+      setResumable(false);
     }
   }
 
@@ -110,6 +112,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
     speedStart.current = null;
     setSavedName(null);
     setMessage("");
+    setResumable(false);
     setStatus("receiving");
     try {
       const name = await receiveFile(
@@ -122,9 +125,10 @@ export default function ReceivePanel({ active }: { active: boolean }) {
       const text = err instanceof Error ? err.message : String(err);
       if (text === "Download cancelled.") {
         // User-initiated: back to idle with a neutral note, keeping the
-        // ticket + folder so Start resumes from the surviving cache.
+        // ticket + folder so Resume continues from the surviving cache.
         setStatus("idle");
-        setMessage("Download cancelled. Start again to resume.");
+        setResumable(true);
+        setMessage("Download cancelled. Resume to continue.");
       } else {
         setStatus("error");
         setMessage(text);
@@ -164,7 +168,10 @@ export default function ReceivePanel({ active }: { active: boolean }) {
         <input
           className="input ticket-input"
           value={ticket}
-          onChange={(e) => setTicket(e.currentTarget.value)}
+          onChange={(e) => {
+            setTicket(e.currentTarget.value);
+            setResumable(false);
+          }}
           placeholder="Paste ticket here…"
           spellCheck={false}
           autoComplete="off"
@@ -205,7 +212,7 @@ export default function ReceivePanel({ active }: { active: boolean }) {
             onClick={handleStart}
             disabled={!canStart}
           >
-            Start receiving
+            {resumable ? "Resume download" : "Start receiving"}
           </button>
         )}
         {status === "receiving" && !progress && (

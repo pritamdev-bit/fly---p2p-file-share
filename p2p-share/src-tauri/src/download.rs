@@ -250,6 +250,17 @@ async fn download_with_retry(
     let mut done = 0u64;
     loop {
         attempt += 1;
+        // Resume accounting: fetch progress counts only bytes downloaded
+        // in this request, so re-seed the bar from what's cached at the
+        // start of every attempt. Fresh downloads seed 0.
+        let base = remote
+            .local((hash, BlobFormat::Raw))
+            .await
+            .map(|info| info.local_bytes())
+            .unwrap_or(0)
+            .min(total);
+        done = done.max(base);
+        let _ = events.send(TransferEvent::Progress { done, total });
         // Attempt 1 reuses the metadata connection. Later attempts dial
         // fresh: after a network change the old connection is dead, and
         // retrying on it would fail every time.
@@ -285,7 +296,7 @@ async fn download_with_retry(
                 }
                 Ok(Some(GetProgressItem::Progress(offset))) => {
                     // Never let the bar move backwards on retooled offsets.
-                    done = done.max(offset).min(total);
+                    done = done.max(base.saturating_add(offset)).min(total);
                     let _ = events.send(TransferEvent::Progress { done, total });
                 }
                 Ok(Some(GetProgressItem::Done(_))) => {
@@ -420,6 +431,61 @@ mod tests {
             cached < 2 * 1024 * 1024,
             "preview pulled file bytes into the cache ({cached} bytes)"
         );
+        started.session.shutdown().await;
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A re-receive against a warm cache must report full progress from
+    /// the first event (the bytes are reused, not re-downloaded) and
+    /// export again successfully.
+    #[tokio::test]
+    async fn cached_rereceive_reports_full_progress() {
+        let base = unique_test_dir("recache");
+        let src_dir = base.join("src");
+        let out_first = base.join("out1");
+        let out_second = base.join("out2");
+        let cache_dir = base.join("cache");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let content: Vec<u8> = (0..32768u32).map(|i| (i.wrapping_mul(3)) as u8).collect();
+        std::fs::write(src_dir.join("again.bin"), &content).unwrap();
+
+        let (send_tx, _send_rx) = mpsc::unbounded_channel();
+        let started = share::start_share(
+            &src_dir.join("again.bin"),
+            share::TicketType::Full,
+            send_tx,
+        )
+        .await
+        .expect("share");
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        receive(&started.ticket, &out_first, &cache_dir, first_tx)
+            .await
+            .expect("first receive");
+
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let name = receive(&started.ticket, &out_second, &cache_dir, second_tx)
+            .await
+            .expect("second receive");
+        assert_eq!(name, "again.bin");
+        assert_eq!(
+            std::fs::read(out_second.join("again.bin")).unwrap(),
+            content
+        );
+        let mut progress_events = 0u32;
+        let mut finished = false;
+        while let Ok(event) = second_rx.try_recv() {
+            match event {
+                TransferEvent::Progress { done, total } => {
+                    progress_events += 1;
+                    assert_eq!(done, total, "re-receive must start at full progress");
+                    assert_eq!(total, content.len() as u64);
+                }
+                TransferEvent::Finished => finished = true,
+                _ => {}
+            }
+        }
+        assert!(progress_events >= 1, "expected progress events");
+        assert!(finished, "expected Finished");
         started.session.shutdown().await;
         std::fs::remove_dir_all(&base).ok();
     }
